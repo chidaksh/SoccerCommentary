@@ -9,6 +9,7 @@ from typing import List
 import pickle as pkl
 import sys
 import io
+from peft import get_peft_model, LoraConfig, TaskType
 
 def process_output_tokens(predict_model, tokens):
     output_texts = []
@@ -33,10 +34,8 @@ class RestrictTokenGenerationLogitsProcessor(LogitsProcessor):
 
 class matchvoice_model(nn.Module):
     def __init__(self,
-                 # LLM part
                  llm_ckpt = "meta-llama/Meta-Llama-3-8B",
                  tokenizer_ckpt = "meta-llama/Meta-Llama-3-8B",
-                 # Q-former part
                  max_frame_pos = 128,
                  window = 30,
                  num_query_tokens = 32,
@@ -51,16 +50,19 @@ class matchvoice_model(nn.Module):
             print(f'kwargs not used: {kwargs}')
         self.device = device
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_ckpt)
-        self.tokenizer.add_tokens(["[PLAYER]","[TEAM]","[COACH]","[REFEREE]","([TEAM])"], special_tokens=True)
+        special_tokens = ["[PLAYER]","[TEAM]","[COACH]","[REFEREE]","([TEAM])"]
+        self.tokenizer.add_tokens(special_tokens, special_tokens=True)
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        
         self.llama_model = AutoModelForCausalLM.from_pretrained(llm_ckpt, torch_dtype=torch.bfloat16)
         self.llama_model.resize_token_embeddings(len(self.tokenizer))
+        
         self.ln_vision = LayerNorm(num_features)
-        self.num_query_tokens = num_query_tokens,
+        self.num_query_tokens = num_query_tokens
         self.num_video_query_token = num_video_query_token
         self.inference = inference
 
-        # Initialize video Q-former
-        self.video_Qformer,self.video_query_tokens = self.init_video_Qformer(num_query_token = num_video_query_token,vision_width=num_features, num_hidden_layers =2)
+        self.video_Qformer, self.video_query_tokens = self.init_video_Qformer(num_query_token = num_video_query_token,vision_width=num_features, num_hidden_layers =2)
         self.video_Qformer.cls = None
         self.video_Qformer.bert.embeddings.word_embeddings = None
         self.video_Qformer.bert.embeddings.position_embeddings = None
@@ -68,27 +70,23 @@ class matchvoice_model(nn.Module):
             layer.output = None
             layer.intermediate = None
 
-        # llama projection
         self.llama_proj = nn.Linear(
             self.video_Qformer.config.hidden_size, self.llama_model.config.hidden_size
         )
-        # video frame positional embedding
         self.video_frame_position_embedding = nn.Embedding(max_frame_pos, num_features)
         self.window = window
-
-        # move to device
+        
         self.llama_model = self.llama_model.to(self.device)
         for name, param in self.llama_model.named_parameters():
             param.requires_grad = False
+            
         self.video_Qformer = self.video_Qformer.to(self.device)
         self.llama_proj = self.llama_proj.to(self.device)
         self.ln_vision = self.ln_vision.to(self.device)
-        for name, param in self.ln_vision.named_parameters():
-            param.requires_grad = False
+            
         self.ln_vision = self.ln_vision.eval()
         self.video_frame_position_embedding = self.video_frame_position_embedding.to(self.device)
 
-        # Here is a trick for inference that generates soccer relevant, you can delete this LogitsProcessorList part (including in generation function)
         file_path = './soccer_words_llama3.pkl'
         with open(file_path, 'rb') as file:
             self.token_ids_list = pkl.load(file)
@@ -97,13 +95,48 @@ class matchvoice_model(nn.Module):
         self.processor = RestrictTokenGenerationLogitsProcessor(allowed_token_id_list=self.token_ids_list)
         self.logits_prosessors = LogitsProcessorList()
         self.logits_prosessors.append(self.processor)
+            
+        lora_config = LoraConfig(
+            r=8,                           
+            lora_alpha=16,
+            target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            bias="none",
+            task_type=TaskType.CAUSAL_LM
+        )
+
+        self.llama_model = get_peft_model(self.llama_model, lora_config)
+        print("LoRA adapters added to LLaMA.")
+        
+        self.video_query_tokens.requires_grad = True
+        for param in self.video_frame_position_embedding.parameters():
+            param.requires_grad = True
+            
+        for name, param in self.llama_model.named_parameters():
+            param.requires_grad = 'lora_' in name
+            
+        for param in self.video_Qformer.parameters():
+            param.requires_grad = False
+
+        for param in self.llama_proj.parameters():
+            param.requires_grad = True
+
+        for name, param in self.ln_vision.named_parameters():
+            param.requires_grad = False
+            
+        k = 1  # number of layers to unfreeze from the end
+        total_layers = len(self.video_Qformer.bert.encoder.layer)
+        for i in range(total_layers - k, total_layers):
+            for param in self.video_Qformer.bert.encoder.layer[i].parameters():
+                param.requires_grad = True
+            
+        total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"\n Total trainable parameters in Phase 1: {total_params:,}")
 
     @classmethod
     def init_video_Qformer(cls, num_query_token, vision_width, num_hidden_layers =2):
         encoder_config = BertConfig.from_pretrained("bert-base-uncased")
         encoder_config.num_hidden_layers = num_hidden_layers
         encoder_config.encoder_width = vision_width
-        # insert cross-attention layer every other block
         encoder_config.add_cross_attention = True
         encoder_config.cross_attention_freq = 1
         encoder_config.query_length = num_query_token
@@ -127,9 +160,14 @@ class matchvoice_model(nn.Module):
         targets = samples['labels']
         atts_llama = samples['attention_mask']
         inputs_ids = samples['input_ids']
-        # print(samples["caption_info"])
+        # breakpoint()
         batch_size = None
         time_length = None
+        assert inputs_ids.max() < self.llama_model.config.vocab_size, f"Input ID {inputs_ids.max()} exceeds vocab size {self.llama_model.config.vocab_size}"
+        assert targets.max() < self.llama_model.config.vocab_size, f"Target ID {targets.max()} exceeds vocab size {self.llama_model.config.vocab_size}"
+        assert samples['input_ids'].shape == samples['attention_mask'].shape, "input_ids and attention_mask must match"
+        assert max(self.token_ids_list) < self.llama_model.config.vocab_size
+        
         try:
             batch_size, time_length, _ = video_features.size()
         except:
@@ -173,10 +211,10 @@ class matchvoice_model(nn.Module):
         targets = targets.to(self.device)
         concat_targets = torch.cat((visual_label, targets), dim=1).to(self.device)
         temp_input_ids = inputs_ids.clone().to(self.device)
-        targets_embeds = self.llama_model.model.embed_tokens(temp_input_ids)
+        targets_embeds = self.llama_model.model.get_input_embeddings()(temp_input_ids)
         embedding_cat = torch.cat((inputs_llama, targets_embeds), dim=1)
         mask_prefix = torch.ones(batch_size, self.num_video_query_token, dtype=atts_llama.dtype)
-        # print(atts_llama.device, mask_prefix.device)
+
         try:
             atts_llama = atts_llama.to(self.device)
             mask_prefix = mask_prefix.to(self.device)
@@ -198,20 +236,21 @@ class matchvoice_model(nn.Module):
         return loss
     
     def generate_text(self, inputs_llama):
-        start_embeds = self.llama_model.model.embed_tokens(torch.tensor([128000]).to(self.device))
+        start_token_id = torch.tensor([128000], device=self.device)
+        start_embeds = self.llama_model.get_input_embeddings()(start_token_id)
         inputs_llama_with_s = torch.cat([inputs_llama, start_embeds.expand(inputs_llama.size(0), -1, -1)], dim=1).to(dtype=torch.bfloat16)
         temp_res_tokens = self.llama_model.generate(
             logits_processor=self.logits_prosessors,
             renormalize_logits=True,
             inputs_embeds=inputs_llama_with_s,
-            max_new_tokens=128,
+            max_new_tokens=64,
             num_beams=5,
             do_sample=True,
             min_length=5,
-            top_p=0.9,
+            top_p=0.7,
             repetition_penalty=1.0,
             length_penalty=1,
-            temperature=1.0,
+            temperature=0.5,
         )
         res_text = process_output_tokens(self, temp_res_tokens)
         return res_text
